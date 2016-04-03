@@ -3,7 +3,6 @@ from __future__ import absolute_import
 # Interface to the Salesforce BULK API
 import os
 from collections import namedtuple
-from httplib2 import Http
 import requests
 import urlparse
 import xml.etree.ElementTree as ET
@@ -159,45 +158,34 @@ class SalesforceBulk(object):
                                   concurrency=concurrency,
                                   external_id_name=external_id_name)
 
-        http = Http()
-        resp, content = http.request(self.endpoint + "/job",
-                                     "POST",
-                                     headers=self.headers(),
-                                     body=doc)
+        resp = requests.post(self.endpoint + "/job",
+                             headers=self.headers(), data=doc)
 
-        self.check_status(resp, content)
+        self.check_status(resp)
 
-        tree = ET.fromstring(content)
+        tree = ET.fromstring(resp.text)
         job_id = tree.findtext("{%s}id" % self.jobNS)
         self.jobs[job_id] = job_id
 
         return job_id
 
-    def check_status(self, resp, content):
-        if resp.status >= 400:
-            msg = "Bulk API HTTP Error result: {0}".format(content)
+    def check_status(self, resp):
+        if resp.status_code >= 400:
+            msg = "Bulk API HTTP Error result: {0}".format(resp.text)
             self.raise_error(msg, resp.status)
 
     def close_job(self, job_id):
         doc = self.create_close_job_doc()
-        http = Http()
         url = self.endpoint + "/job/%s" % job_id
-        resp, content = http.request(url, "POST", headers=self.headers(),
-                                     body=doc)
-        self.check_status(resp, content)
+        resp = requests.post(url, headers=self.headers(), data=doc)
+        self.check_status(resp)
 
     def abort_job(self, job_id):
         """Abort a given bulk job"""
         doc = self.create_abort_job_doc()
-        http = Http()
         url = self.endpoint + "/job/%s" % job_id
-        resp, content = http.request(
-            url,
-            "POST",
-            headers=self.headers(),
-            body=doc
-        )
-        self.check_status(resp, content)
+        resp = requests.post(url, headers=self.headers(), data=doc)
+        self.check_status(resp)
 
     def create_job_doc(self, object_name=None, operation=None,
                        contentType='CSV', concurrency=None, external_id_name=None):
@@ -251,15 +239,13 @@ class SalesforceBulk(object):
             job_id = self.create_job(
                 re.search(re.compile("from (\w+)", re.I), soql).group(1),
                 "query")
-        http = Http()
         uri = self.endpoint + "/job/%s/batch" % job_id
         headers = self.headers({"Content-Type": "text/csv"})
-        resp, content = http.request(uri, method="POST", body=soql,
-                                     headers=headers)
+        resp = requests.post(uri, data=soql, headers=headers)
 
-        self.check_status(resp, content)
+        self.check_status(resp)
 
-        tree = ET.fromstring(content)
+        tree = ET.fromstring(resp.text)
         batch_id = tree.findtext("{%s}id" % self.jobNS)
 
         self.batches[batch_id] = job_id
@@ -398,13 +384,12 @@ class SalesforceBulk(object):
 
         job_id = job_id or self.lookup_job_id(batch_id)
 
-        http = Http()
         uri = self.endpoint + \
             "/job/%s/batch/%s" % (job_id, batch_id)
-        resp, content = http.request(uri, headers=self.headers())
-        self.check_status(resp, content)
+        resp = requests.get(uri, headers=self.headers())
+        self.check_status(resp)
 
-        tree = ET.fromstring(content)
+        tree = ET.fromstring(resp.text)
         result = {}
         for child in tree:
             result[re.sub("{.*?}", "", child.tag)] = child.text
@@ -545,13 +530,12 @@ class SalesforceBulk(object):
 
         if not self.is_batch_done(job_id, batch_id):
             return False
-        http = Http()
         uri = self.endpoint + \
             "/job/%s/batch/%s/result" % (job_id, batch_id)
-        resp, content = http.request(uri, method="GET", headers=self.headers())
+        resp = requests.get(uri, headers=self.headers())
 
         tf = TemporaryFile()
-        tf.write(content)
+        tf.write(resp.text)
 
         total_remaining = self.count_file_lines(tf)
         if logger:

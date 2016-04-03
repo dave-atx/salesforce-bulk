@@ -17,7 +17,6 @@ packages = [
 ]
 
 requires = [
-    'httplib2>=0.7.5',
     'requests>=2.2.1',
 ]
 
