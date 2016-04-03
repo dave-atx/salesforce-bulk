@@ -5,11 +5,9 @@ import os
 from collections import namedtuple
 from httplib2 import Http
 import requests
-import urllib2
 import urlparse
-import requests
 import xml.etree.ElementTree as ET
-from tempfile import TemporaryFile, NamedTemporaryFile
+from tempfile import TemporaryFile
 import StringIO
 import re
 import time
@@ -50,12 +48,15 @@ class BulkBatchFailed(BulkApiError):
 
 class SalesforceBulk(object):
 
-    def __init__(self, sessionId=None, host=None, username=None, password=None,
-                 exception_class=BulkApiError, API_version="29.0"):
+    def __init__(self, sessionId=None, host='login.salesforce.com',
+                 username=None, password=None, oauth=True,
+                 exception_class=BulkApiError, API_version="36.0"):
         if not sessionId and not username:
             raise RuntimeError(
                 "Must supply either sessionId/instance_url or username/password")
-        if not sessionId:
+        elif not sessionId and not oauth:
+            host, sessionId = SalesforceBulk.login(username, password, host, API_version)
+        elif not sessionId:
             sessionId, endpoint = SalesforceBulk.login_to_salesforce(
                 username, password)
             host = urlparse.urlparse(endpoint)
@@ -72,6 +73,34 @@ class SalesforceBulk(object):
         self.batches = {}  # dict of batch_id => job_id
         self.batch_statuses = {}
         self.exception_class = exception_class
+
+    @staticmethod
+    def login(username, password, host, API_version):
+        """Login to salesforce.com. Returns a tuple of the server hostname and session ID.
+        Args:
+            username - SFDC username
+            password - SFDC password + server token concatenated
+            host - SFDC login host - either login.salesforce.com or test.salsesforce.com
+        """
+        LOGIN = ('<?xml version="1.0" encoding="utf-8" ?>'
+                 '<env:Envelope xmlns:xsd="http://www.w3.org/2001/XMLSchema"'
+                 '    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+                 '    xmlns:env="http://schemas.xmlsoap.org/soap/envelope/">'
+                 '  <env:Body>'
+                 '    <n1:login xmlns:n1="urn:partner.soap.sforce.com">'
+                 '      <n1:username>{username}</n1:username>'
+                 '      <n1:password>{password}</n1:password>'
+                 '    </n1:login>'
+                 '  </env:Body>'
+                 '</env:Envelope>')
+        SERVER_URL = './/{urn:partner.soap.sforce.com}serverUrl'
+        SESSION_ID = './/{urn:partner.soap.sforce.com}sessionId'
+        headers = {'Content-Type': 'text/xml; charset=UTF-8', 'SOAPAction': 'login'}
+        payload = LOGIN.format(username=username, password=password)
+        login_endpoint = 'https://{}/services/Soap/u/{}'.format(host, API_version)
+        r = requests.post(login_endpoint, data=payload, headers=headers)
+        tree = ET.parse(StringIO.StringIO(r.content))
+        return (urlparse.urlparse(tree.find(SERVER_URL).text).hostname, tree.find(SESSION_ID).text)
 
     @staticmethod
     def login_to_salesforce(username, password):
@@ -313,16 +342,13 @@ class SalesforceBulk(object):
         def save_results(tf, **kwargs):
             results.append(tf.read())
 
-        flag = self.get_batch_results(
+        self.get_batch_results(
             query_job_id, query_batch_id, callback=save_results)
 
         if job_id is None:
             job_id = self.create_job(object_type, "delete")
-        http = Http()
-        # Split a large CSV into manageable batches
-        batches = self.split_csv(csv, batch_size)
-        batch_ids = []
 
+        batch_ids = []
         uri = self.endpoint + "/job/%s/batch" % job_id
         headers = self.headers({"Content-Type": "text/csv"})
         for batch in results:
@@ -348,9 +374,7 @@ class SalesforceBulk(object):
                 "Batch id '%s' is uknown, can't retrieve job_id" % batch_id)
 
     def job_status(self, job_id=None):
-        job_id = job_id or self.lookup_job_id(batch_id)
-        uri = urlparse.urljoin(self.endpoint +"/",
-            'job/{0}'.format(job_id))
+        uri = urlparse.urljoin(self.endpoint + "/", 'job/{0}'.format(job_id))
         response = requests.get(uri, headers=self.headers())
         if response.status_code != 200:
             self.raise_error(response.content, response.status_code)
