@@ -3,3 +3,4 @@ salesforce_bulk.egg-info*
 build/*
 dist/*
 *.pyc
+python

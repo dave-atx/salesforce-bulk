@@ -1,16 +1,12 @@
 from __future__ import absolute_import
 
 # Interface to the Salesforce BULK API
-import os
 from collections import namedtuple
 import requests
+import StringIO
+import time
 import urlparse
 import xml.etree.ElementTree as ET
-from tempfile import TemporaryFile
-import StringIO
-import re
-import time
-import csv
 
 from . import bulk_states
 
@@ -18,14 +14,12 @@ UploadResult = namedtuple('UploadResult', 'id success created error')
 
 
 class BulkApiError(Exception):
-
     def __init__(self, message, status_code=None):
         super(BulkApiError, self).__init__(message)
         self.status_code = status_code
 
 
 class BulkJobAborted(BulkApiError):
-
     def __init__(self, job_id):
         self.job_id = job_id
 
@@ -34,7 +28,6 @@ class BulkJobAborted(BulkApiError):
 
 
 class BulkBatchFailed(BulkApiError):
-
     def __init__(self, job_id, batch_id, state_message):
         self.job_id = job_id
         self.batch_id = batch_id
@@ -45,33 +38,157 @@ class BulkBatchFailed(BulkApiError):
         super(BulkBatchFailed, self).__init__(message)
 
 
-class SalesforceBulk(object):
+class Batch(object):
+    def __init__(self, session, job_endpoint, batch_id):
+        self.session = session
+        self.endpoint = "{}/batch/{}".format(job_endpoint, batch_id)
+        self.batch_id = batch_id
+        self._status = None
 
+    def status(self, reload=False):
+        if reload or self._status is None:
+            resp = self.session.get(self.endpoint)
+            SalesforceBulk.check_status(resp)
+            self._status = resp.json()
+        return self._status
+
+    def is_done(self, reload=False):
+        batch_status = self.status(reload)
+        batch_state = batch_status['state'] if 'state' in batch_status else None
+        if batch_state in bulk_states.ERROR_STATES:
+            raise BulkBatchFailed(batch_status['jobId'], batch_status['id'],
+                                  batch_status['stateMessage'])
+        return batch_state == bulk_states.COMPLETED
+
+    # Wait for all batches in this job to complete, waiting at most timeout seconds
+    # (defaults to 10 minutes).
+    def wait(self, timeout=60 * 10, sleep_interval=10):
+        waited = 0
+        while not self.is_done(True) and waited < timeout:
+            time.sleep(sleep_interval)
+            waited += sleep_interval
+
+    def results(self):
+        if not self.is_done():
+            self.wait()
+        uri = self.endpoint + '/result'
+        resp = self.session.get(uri)
+        SalesforceBulk.check_status(resp)
+        for row in resp.json():
+            yield row
+
+
+class BatchQuery(Batch):
+    def __init__(self, session, job_endpoint, batch_id):
+        Batch.__init__(self, session, job_endpoint, batch_id)
+
+    def results(self):
+        if not self.is_done():
+            self.wait()
+        uri = self.endpoint + '/result'
+        resp = self.session.get(uri)
+        SalesforceBulk.check_status(resp)
+        result_ids = resp.json()
+        for result_id in result_ids:
+            uri = "{}/result/{}".format(self.endpoint, result_id)
+            resp = self.session.get(uri)
+            SalesforceBulk.check_status(resp)
+            for row in resp.json():
+                yield row
+
+
+class Job(object):
+    def __init__(self, session, endpoint, job_id):
+        self.session = session
+        self.endpoint = "{}/job/{}".format(endpoint, job_id)
+        self.job_id = job_id
+        self.batches = []
+
+    def close(self):
+        """Close this job."""
+        resp = self.session.post(self.endpoint, json={'state': 'Closed'})
+        SalesforceBulk.check_status(resp)
+
+    def abort(self):
+        """Abort this job."""
+        resp = self.session.post(self.endpoint, json={'state': 'Aborted'})
+        SalesforceBulk.check_status(resp)
+
+    def query(self, soql):
+        """Create a batch query."""
+        uri = self.endpoint + "/batch"
+        resp = self.session.post(uri, data=soql)
+        SalesforceBulk.check_status(resp)
+        batch = BatchQuery(self.session, self.endpoint, resp.json()['id'])
+        self.batches.append(batch)
+        return batch
+
+    def post(self, data):
+        """Create a batch upload."""
+        uri = self.endpoint + "/batch"
+        resp = self.session.post(uri, json=data)
+        SalesforceBulk.check_status(resp)
+        batch = Batch(self.session, self.endpoint, resp.json()['id'])
+        self.batches.append(batch)
+        return batch
+
+    # Wait for all batches in this job to complete, waiting at most timeout seconds
+    # (defaults to 10 minutes).
+    def wait(self, timeout=60 * 10, sleep_interval=10):
+        for batch in self.batches:
+            batch.wait(timeout, sleep_interval)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc, value, traceback):
+        self.close()
+
+
+class SalesforceBulk(object):
     def __init__(self, sessionId=None, host='login.salesforce.com',
-                 username=None, password=None, oauth=True,
+                 username=None, password=None,
                  exception_class=BulkApiError, API_version="36.0"):
         if not sessionId and not username:
             raise RuntimeError(
                 "Must supply either sessionId/instance_url or username/password")
-        elif not sessionId and not oauth:
-            host, sessionId = SalesforceBulk.login(username, password, host, API_version)
-        elif not sessionId:
-            sessionId, endpoint = SalesforceBulk.login_to_salesforce(
-                username, password)
-            host = urlparse.urlparse(endpoint)
-            host = host.hostname.replace("-api", "")
 
-        if host[0:4] == 'http':
-            self.endpoint = host
-        else:
-            self.endpoint = "https://" + host
-        self.endpoint += "/services/async/%s" % API_version
-        self.sessionId = sessionId
-        self.jobNS = 'http://www.force.com/2009/06/asyncapi/dataload'
-        self.jobs = {}  # dict of job_id => job_id
-        self.batches = {}  # dict of batch_id => job_id
-        self.batch_statuses = {}
-        self.exception_class = exception_class
+        host, sessionId = SalesforceBulk.login(username, password, host, API_version)
+
+        self.endpoint = "https://{}/services/async/{}".format(host, API_version)
+        self.session = requests.Session()
+        self.session.headers["X-SFDC-Session"] = sessionId
+        self.session.headers["Content-Type"] = "application/json"
+
+    def create_query_job(self, object_name, **kwargs):
+        return self.create_job(object_name, "query", **kwargs)
+
+    def create_insert_job(self, object_name, **kwargs):
+        return self.create_job(object_name, "insert", **kwargs)
+
+    def create_upsert_job(self, object_name, external_id_name, **kwargs):
+        return self.create_job(object_name, "upsert", external_id_name=external_id_name, **kwargs)
+
+    def create_update_job(self, object_name, **kwargs):
+        return self.create_job(object_name, "update", **kwargs)
+
+    def create_delete_job(self, object_name, **kwargs):
+        return self.create_job(object_name, "delete", **kwargs)
+
+    def create_job(self, object_name=None, operation=None,
+                   concurrency=None, external_id_name=None):
+        assert(object_name is not None)
+        assert(operation is not None)
+
+        description = {'operation': operation, 'object': object_name, 'contentType': 'JSON'}
+        if external_id_name:
+            description['externalIdFieldName'] = external_id_name
+        if concurrency:
+            description['concurrencyMode'] = concurrency
+
+        resp = self.session.post(self.endpoint + "/job", json=description)
+        SalesforceBulk.check_status(resp)
+        return Job(self.session, self.endpoint, resp.json()['id'])
 
     @staticmethod
     def login(username, password, host, API_version):
@@ -102,496 +219,7 @@ class SalesforceBulk(object):
         return (urlparse.urlparse(tree.find(SERVER_URL).text).hostname, tree.find(SESSION_ID).text)
 
     @staticmethod
-    def login_to_salesforce(username, password):
-        env_vars = (
-            'SALESFORCE_CLIENT_ID',
-            'SALESFORCE_CLIENT_SECRET',
-            'SALESFORCE_REDIRECT_URI',
-        )
-        missing_env_vars = [e for e in env_vars if e not in os.environ]
-        if missing_env_vars:
-            raise RuntimeError(
-                "You must set {0} to use username/pass login".format(
-                    ', '.join(missing_env_vars)))
-
-        try:
-            import salesforce_oauth_request
-        except ImportError:
-            raise ImportError(
-                "You must install salesforce-oauth-request to use username/password")
-
-        packet = salesforce_oauth_request.login(
-            username=username, password=password)
-        return packet['access_token'], packet['instance_url']
-
-    def headers(self, values={}):
-        default = {"X-SFDC-Session": self.sessionId,
-                   "Content-Type": "application/xml; charset=UTF-8"}
-        for k, val in values.iteritems():
-            default[k] = val
-        return default
-
-    # Register a new Bulk API job - returns the job id
-    def create_query_job(self, object_name, **kwargs):
-        return self.create_job(object_name, "query", **kwargs)
-
-    def create_insert_job(self, object_name, **kwargs):
-        return self.create_job(object_name, "insert", **kwargs)
-
-    def create_upsert_job(self, object_name, external_id_name, **kwargs):
-        return self.create_job(object_name, "upsert", external_id_name=external_id_name, **kwargs)
-
-    def create_update_job(self, object_name, **kwargs):
-        return self.create_job(object_name, "update", **kwargs)
-
-    def create_delete_job(self, object_name, **kwargs):
-        return self.create_job(object_name, "delete", **kwargs)
-
-    def create_job(self, object_name=None, operation=None, contentType='CSV',
-                   concurrency=None, external_id_name=None):
-        assert(object_name is not None)
-        assert(operation is not None)
-
-        doc = self.create_job_doc(object_name=object_name,
-                                  operation=operation,
-                                  contentType=contentType,
-                                  concurrency=concurrency,
-                                  external_id_name=external_id_name)
-
-        resp = requests.post(self.endpoint + "/job",
-                             headers=self.headers(), data=doc)
-
-        self.check_status(resp)
-
-        tree = ET.fromstring(resp.text)
-        job_id = tree.findtext("{%s}id" % self.jobNS)
-        self.jobs[job_id] = job_id
-
-        return job_id
-
-    def check_status(self, resp):
-        if resp.status_code >= 400:
-            msg = "Bulk API HTTP Error result: {0}".format(resp.text)
-            self.raise_error(msg, resp.status)
-
-    def close_job(self, job_id):
-        doc = self.create_close_job_doc()
-        url = self.endpoint + "/job/%s" % job_id
-        resp = requests.post(url, headers=self.headers(), data=doc)
-        self.check_status(resp)
-
-    def abort_job(self, job_id):
-        """Abort a given bulk job"""
-        doc = self.create_abort_job_doc()
-        url = self.endpoint + "/job/%s" % job_id
-        resp = requests.post(url, headers=self.headers(), data=doc)
-        self.check_status(resp)
-
-    def create_job_doc(self, object_name=None, operation=None,
-                       contentType='CSV', concurrency=None, external_id_name=None):
-        root = ET.Element("jobInfo")
-        root.set("xmlns", self.jobNS)
-        op = ET.SubElement(root, "operation")
-        op.text = operation
-        obj = ET.SubElement(root, "object")
-        obj.text = object_name
-        if external_id_name:
-            ext = ET.SubElement(root, 'externalIdFieldName')
-            ext.text = external_id_name
-
-        if concurrency:
-            con = ET.SubElement(root, "concurrencyMode")
-            con.text = concurrency
-        ct = ET.SubElement(root, "contentType")
-        ct.text = contentType
-
-        buf = StringIO.StringIO()
-        tree = ET.ElementTree(root)
-        tree.write(buf, encoding="UTF-8")
-        return buf.getvalue()
-
-    def create_close_job_doc(self):
-        root = ET.Element("jobInfo")
-        root.set("xmlns", self.jobNS)
-        state = ET.SubElement(root, "state")
-        state.text = "Closed"
-
-        buf = StringIO.StringIO()
-        tree = ET.ElementTree(root)
-        tree.write(buf, encoding="UTF-8")
-        return buf.getvalue()
-
-    def create_abort_job_doc(self):
-        """Create XML doc for aborting a job"""
-        root = ET.Element("jobInfo")
-        root.set("xmlns", self.jobNS)
-        state = ET.SubElement(root, "state")
-        state.text = "Aborted"
-
-        buf = StringIO.StringIO()
-        tree = ET.ElementTree(root)
-        tree.write(buf, encoding="UTF-8")
-        return buf.getvalue()
-
-    # Add a BulkQuery to the job - returns the batch id
-    def query(self, job_id, soql):
-        if job_id is None:
-            job_id = self.create_job(
-                re.search(re.compile("from (\w+)", re.I), soql).group(1),
-                "query")
-        uri = self.endpoint + "/job/%s/batch" % job_id
-        headers = self.headers({"Content-Type": "text/csv"})
-        resp = requests.post(uri, data=soql, headers=headers)
-
-        self.check_status(resp)
-
-        tree = ET.fromstring(resp.text)
-        batch_id = tree.findtext("{%s}id" % self.jobNS)
-
-        self.batches[batch_id] = job_id
-
-        return batch_id
-
-    def split_csv(self, csv, batch_size):
-        csv_io = StringIO.StringIO(csv)
-        batches = []
-
-        for i, line in enumerate(csv_io):
-            if not i:
-                headers = line
-                batch = headers
-                continue
-            if not i % batch_size:
-                batches.append(batch)
-                batch = headers
-
-            batch += line
-
-        batches.append(batch)
-
-        return batches
-
-    # Add a BulkUpload to the job - returns the batch id
-    def bulk_csv_upload(self, job_id, csv, batch_size=2500):
-        # Split a large CSV into manageable batches
-        batches = self.split_csv(csv, batch_size)
-        batch_ids = []
-
-        uri = self.endpoint + "/job/%s/batch" % job_id
-        headers = self.headers({"Content-Type": "text/csv"})
-        for batch in batches:
-            resp = requests.post(uri, data=batch, headers=headers)
-            content = resp.content
-
-            if resp.status_code >= 400:
-                self.raise_error(content, resp.status)
-
-            tree = ET.fromstring(content)
-            batch_id = tree.findtext("{%s}id" % self.jobNS)
-
-            self.batches[batch_id] = job_id
-            batch_ids.append(batch_id)
-
-        return batch_ids
-
-    def raise_error(self, message, status_code=None):
-        if status_code:
-            message = "[{0}] {1}".format(status_code, message)
-
-        if self.exception_class == BulkApiError:
-            raise self.exception_class(message, status_code=status_code)
-        else:
-            raise self.exception_class(message)
-
-    def post_bulk_batch(self, job_id, csv_generator):
-        uri = self.endpoint + "/job/%s/batch" % job_id
-        headers = self.headers({"Content-Type": "text/csv"})
-        resp = requests.post(uri, data=csv_generator, headers=headers)
-        content = resp.content
-
-        if resp.status_code >= 400:
-            self.raise_error(content, resp.status_code)
-
-        tree = ET.fromstring(content)
-        batch_id = tree.findtext("{%s}id" % self.jobNS)
-        return batch_id
-
-    # Add a BulkDelete to the job - returns the batch id
-    def bulk_delete(self, job_id, object_type, where, batch_size=2500):
-        query_job_id = self.create_query_job(object_type)
-        soql = "Select Id from %s where %s Limit 10000" % (object_type, where)
-        query_batch_id = self.query(query_job_id, soql)
-        self.wait_for_batch(query_job_id, query_batch_id, timeout=120)
-
-        results = []
-
-        def save_results(tf, **kwargs):
-            results.append(tf.read())
-
-        self.get_batch_results(
-            query_job_id, query_batch_id, callback=save_results)
-
-        if job_id is None:
-            job_id = self.create_job(object_type, "delete")
-
-        batch_ids = []
-        uri = self.endpoint + "/job/%s/batch" % job_id
-        headers = self.headers({"Content-Type": "text/csv"})
-        for batch in results:
-            resp = requests.post(uri, data=batch, headers=headers)
-            content = resp.content
-
-            if resp.status_code >= 400:
-                self.raise_error(content, resp.status)
-
-            tree = ET.fromstring(content)
-            batch_id = tree.findtext("{%s}id" % self.jobNS)
-
-            self.batches[batch_id] = job_id
-            batch_ids.append(batch_id)
-
-        return batch_ids
-
-    def lookup_job_id(self, batch_id):
-        try:
-            return self.batches[batch_id]
-        except KeyError:
-            raise Exception(
-                "Batch id '%s' is uknown, can't retrieve job_id" % batch_id)
-
-    def job_status(self, job_id=None):
-        uri = urlparse.urljoin(self.endpoint + "/", 'job/{0}'.format(job_id))
-        response = requests.get(uri, headers=self.headers())
-        if response.status_code != 200:
-            self.raise_error(response.content, response.status_code)
-
-        tree = ET.fromstring(response.content)
-        result = {}
-        for child in tree:
-            result[re.sub("{.*?}", "", child.tag)] = child.text
-        return result
-
-    def job_state(self, job_id):
-        status = self.job_status(job_id)
-        if 'state' in status:
-            return status['state']
-        else:
-            return None
-
-    def batch_status(self, job_id=None, batch_id=None, reload=False):
-        if not reload and batch_id in self.batch_statuses:
-            return self.batch_statuses[batch_id]
-
-        job_id = job_id or self.lookup_job_id(batch_id)
-
-        uri = self.endpoint + \
-            "/job/%s/batch/%s" % (job_id, batch_id)
-        resp = requests.get(uri, headers=self.headers())
-        self.check_status(resp)
-
-        tree = ET.fromstring(resp.text)
-        result = {}
-        for child in tree:
-            result[re.sub("{.*?}", "", child.tag)] = child.text
-
-        self.batch_statuses[batch_id] = result
-        return result
-
-    def batch_state(self, job_id, batch_id, reload=False):
-        status = self.batch_status(job_id, batch_id, reload=reload)
-        if 'state' in status:
-            return status['state']
-        else:
-            return None
-
-    def is_batch_done(self, job_id, batch_id):
-        batch_state = self.batch_state(job_id, batch_id, reload=True)
-        if batch_state in bulk_states.ERROR_STATES:
-            status = self.batch_status(job_id, batch_id)
-            raise BulkBatchFailed(job_id, batch_id, status['stateMessage'])
-        return batch_state == bulk_states.COMPLETED
-
-    # Wait for the given batch to complete, waiting at most timeout seconds
-    # (defaults to 10 minutes).
-    def wait_for_batch(self, job_id, batch_id, timeout=60 * 10,
-                       sleep_interval=10):
-        waited = 0
-        while not self.is_batch_done(job_id, batch_id) and waited < timeout:
-            time.sleep(sleep_interval)
-            waited += sleep_interval
-
-    def get_batch_result_ids(self, batch_id, job_id=None):
-        job_id = job_id or self.lookup_job_id(batch_id)
-        if not self.is_batch_done(job_id, batch_id):
-            return False
-
-        uri = urlparse.urljoin(
-            self.endpoint + "/",
-            "job/{0}/batch/{1}/result".format(
-                job_id, batch_id),
-        )
-        resp = requests.get(uri, headers=self.headers())
-        if resp.status_code != 200:
-            return False
-
-        tree = ET.fromstring(resp.content)
-        find_func = getattr(tree, 'iterfind', tree.findall)
-        return [str(r.text) for r in
-                find_func("{{{0}}}result".format(self.jobNS))]
-
-    def get_all_results_for_batch(self, batch_id, job_id=None, parse_csv=False, logger=None):
-        """
-        Gets result ids and generates each result set from the batch and returns it
-        as an generator fetching the next result set when needed
-
-        Args:
-            batch_id: id of batch
-            job_id: id of job, if not provided, it will be looked up
-            parse_csv: if true, results will be dictionaries instead of lines
-        """
-        result_ids = self.get_batch_result_ids(batch_id, job_id=job_id)
-        if not result_ids:
-            if logger:
-                logger.error('Batch is not complete, may have timed out. '
-                             'batch_id: %s, job_id: %s', batch_id, job_id)
-            raise RuntimeError('Batch is not complete')
-        for result_id in result_ids:
-            yield self.get_batch_results(
-                batch_id,
-                result_id,
-                job_id=job_id,
-                parse_csv=parse_csv)
-
-    def get_batch_results(self, batch_id, result_id, job_id=None,
-                          parse_csv=False, logger=None):
-        job_id = job_id or self.lookup_job_id(batch_id)
-        logger = logger or (lambda message: None)
-
-        uri = urlparse.urljoin(
-            self.endpoint + "/",
-            "job/{0}/batch/{1}/result/{2}".format(
-                job_id, batch_id, result_id),
-        )
-        logger('Downloading bulk result file id=#{0}'.format(result_id))
-        resp = requests.get(uri, headers=self.headers(), stream=True)
-
-        if not parse_csv:
-            iterator = resp.iter_lines()
-        else:
-            iterator = csv.reader(resp.iter_lines(), delimiter=',',
-                                  quotechar='"')
-
-        BATCH_SIZE = 5000
-        for i, line in enumerate(iterator):
-            if i % BATCH_SIZE == 0:
-                logger('Loading bulk result #{0}'.format(i))
-            yield line
-
-    def get_batch_result_iter(self, job_id, batch_id, parse_csv=False,
-                              logger=None):
-        """
-        Return a line interator over the contents of a batch result document. If
-        csv=True then parses the first line as the csv header and the iterator
-        returns dicts.
-        """
-        status = self.batch_status(job_id, batch_id)
-        if status['state'] != 'Completed':
-            return None
-        elif logger:
-            if 'numberRecordsProcessed' in status:
-                logger("Bulk batch %d processed %s records" %
-                       (batch_id, status['numberRecordsProcessed']))
-            if 'numberRecordsFailed' in status:
-                failed = int(status['numberRecordsFailed'])
-                if failed > 0:
-                    logger("Bulk batch %d had %d failed records" %
-                           (batch_id, failed))
-
-        uri = self.endpoint + \
-            "/job/%s/batch/%s/result" % (job_id, batch_id)
-        r = requests.get(uri, headers=self.headers(), stream=True)
-
-        result_id = r.text.split("<result>")[1].split("</result>")[0]
-
-        uri = self.endpoint + \
-            "/job/%s/batch/%s/result/%s" % (job_id, batch_id, result_id)
-        r = requests.get(uri, headers=self.headers(), stream=True)
-
-        if parse_csv:
-            return csv.DictReader(r.iter_lines(chunk_size=2048), delimiter=",",
-                                  quotechar='"')
-        else:
-            return r.iter_lines(chunk_size=2048)
-
-    def get_upload_results(self, job_id, batch_id,
-                           callback=(lambda *args, **kwargs: None),
-                           batch_size=0, logger=None):
-        job_id = job_id or self.lookup_job_id(batch_id)
-
-        if not self.is_batch_done(job_id, batch_id):
-            return False
-        uri = self.endpoint + \
-            "/job/%s/batch/%s/result" % (job_id, batch_id)
-        resp = requests.get(uri, headers=self.headers())
-
-        tf = TemporaryFile()
-        tf.write(resp.text)
-
-        total_remaining = self.count_file_lines(tf)
-        if logger:
-            logger("Total records: %d" % total_remaining)
-        tf.seek(0)
-
-        records = []
-        line_number = 0
-        col_names = []
-        reader = csv.reader(tf, delimiter=",", quotechar='"')
-        for row in reader:
-            line_number += 1
-            records.append(UploadResult(*row))
-            if len(records) == 1:
-                col_names = records[0]
-            if batch_size > 0 and len(records) >= (batch_size + 1):
-                callback(records, total_remaining, line_number)
-                total_remaining -= (len(records) - 1)
-                records = [col_names]
-        callback(records, total_remaining, line_number)
-
-        tf.close()
-
-        return True
-
-    def parse_csv(self, tf, callback, batch_size, total_remaining):
-        records = []
-        line_number = 0
-        col_names = []
-        reader = csv.reader(tf, delimiter=",", quotechar='"')
-        for row in reader:
-            line_number += 1
-            records.append(row)
-            if len(records) == 1:
-                col_names = records[0]
-            if batch_size > 0 and len(records) >= (batch_size + 1):
-                callback(records, total_remaining, line_number)
-                total_remaining -= (len(records) - 1)
-                records = [col_names]
-        return records, total_remaining
-
-    def count_file_lines(self, tf):
-        tf.seek(0)
-        buffer = bytearray(2048)
-        lines = 0
-
-        quotes = 0
-        while tf.readinto(buffer) > 0:
-            quoteChar = ord('"')
-            newline = ord('\n')
-            for c in buffer:
-                if c == quoteChar:
-                    quotes += 1
-                elif c == newline:
-                    if (quotes % 2) == 0:
-                        lines += 1
-                        quotes = 0
-
-        return lines
+    def check_status(response):
+        if response.status_code >= 400:
+            msg = "Bulk API HTTP Error result: {0}".format(response.text)
+            raise BulkApiError(msg, response.status)
