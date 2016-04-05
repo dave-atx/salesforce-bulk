@@ -1,7 +1,7 @@
 from __future__ import absolute_import
 
 # Interface to the Salesforce BULK API
-from collections import namedtuple
+
 import requests
 import StringIO
 import time
@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 
 from . import bulk_states
 
-UploadResult = namedtuple('UploadResult', 'id success created error')
+DEFAULT_BATCH_SIZE = 2500
 
 
 class BulkApiError(Exception):
@@ -123,14 +123,25 @@ class Job(object):
         self.batches.append(batch)
         return batch
 
-    def post(self, data):
+    def post(self, data, batch_size=DEFAULT_BATCH_SIZE):
         """Create a batch upload."""
         uri = self.endpoint + "/batch"
-        resp = self.session.post(uri, json=data)
-        SalesforceBulk.check_status(resp)
-        batch = Batch(self.session, self.endpoint, resp.json()['id'])
-        self.batches.append(batch)
-        return batch
+        batches = []
+        # create one batch for each set of batch_size rows in data
+        for i in xrange(0, len(data), batch_size):
+            resp = self.session.post(uri, json=data[i:i+batch_size])
+            SalesforceBulk.check_status(resp)
+            batch = Batch(self.session, self.endpoint, resp.json()['id'])
+            self.batches.append(batch)
+            batches.append(batch)
+        return batches
+
+    def results(self):
+        if not self.is_done():
+            self.wait()
+        for batch in self.batches:
+            for row in batch.results():
+                yield row
 
     # Wait for all batches in this job to complete, waiting at most timeout seconds
     # (defaults to 10 minutes).
