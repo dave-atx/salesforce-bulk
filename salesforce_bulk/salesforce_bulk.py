@@ -143,6 +143,9 @@ class Job(object):
             for row in batch.results():
                 yield row
 
+    def is_done(self):
+        return all(self.batches, lambda b: b.is_done())
+
     # Wait for all batches in this job to complete, waiting at most timeout seconds
     # (defaults to 10 minutes).
     def wait(self, timeout=60 * 10, sleep_interval=10):
